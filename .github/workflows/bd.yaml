@@ -1,0 +1,128 @@
+name: 🎲 Preparando dados para construir o Banco de Dados da aplicação
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: write
+
+jobs:
+  send-data-bd:
+    name: Enviando dados para construir o banco de Dados do seu projeto
+    runs-on: ubuntu-latest
+    permissions: 
+      contents: write
+    steps:
+      - uses: actions/checkout@v5.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.TAG_GITHUB_TOKEN }}
+      
+      - name: Preparando tudo para enviar os dados necessários para a criação do BD - Secrets
+        id: arquivo-deploy-secrets
+        run: |
+          git config --global user.name "[bot]-actions"
+          git config --global user.email "[bot]-actions@users.noreply.github.com"
+
+          # definindo a branch "main"
+          git config --global init.defaultBranch main
+          
+          resolved_env=".deploy.resolved.env"
+          cp .deploy.env $resolved_env
+
+          # Extraindo os placeholders no formato @NOME_SEGREDO@
+          vars=$(grep -oE '@[A-Z0-9_]+@' .deploy.env | tr -d '@' | sort -u)
+
+          # Secrets disponíveis em JSON
+          ALL_SECRETS='${{ toJson(secrets) }}'
+
+          for var in $vars; do
+            value=$(jq -r --arg key "$var" '.[$key]' <<< "$ALL_SECRETS")
+            if [ "$value" = "null" ]; then
+              echo "❌ Secret '$var' não encontrado no repositório!"
+              exit 1
+            fi
+
+            sed -i "s|@$var@|$value|g" $resolved_env
+            echo "${var}=${value}" >> $GITHUB_OUTPUT
+            echo "PWD_BD=${value}" >> $GITHUB_OUTPUT 
+          done
+
+      - name: Preparando as variáveis complementares para criar o BD
+        id: deploy_env
+        run: |
+          while IFS=$'\n' read -r line; do
+            if [[ -n "$line" && "$line" != \#* ]]; then
+              IFS='=' read -r key value <<< "$line"
+                # echo "${key}=${value}"
+              echo "${key}=${value}" >> $GITHUB_OUTPUT
+            fi
+          done < .deploy.env
+
+      - name: 📬 Preparando dados para repositório de Infra
+        env:
+          NOME_PROJETO: ${{ steps.deploy_env.outputs.NOME_DO_PROJETO }}
+          REPOSITORIO_INFRA: "Deploy-to-RNP-K8s-Cluster/repoInfra"
+        run: |
+          PROJETO_PATH="projetos/$NOME_PROJETO/bd"
+
+          NOVA_SECRET_NAME="BD_${NOME_PROJETO}_PWD"
+          sed -i -E "s/@[^@]+@/@${NOVA_SECRET_NAME}@/" .deploy.env
+
+          echo ${{ secrets.TAG_GITHUB_TOKEN }}   | gh auth login --with-token
+
+          # Criando diretório temporário
+          WORK_DIR="temp_repo_$(date +%s)"
+          mkdir "$WORK_DIR"
+          cd "$WORK_DIR"
+
+          # Inicializar repositório e adicionar repo remoto
+          git init
+          git remote add origin "https://${{ secrets.TAG_GITHUB_TOKEN }}@github.com/${REPOSITORIO_INFRA}.git"
+          
+
+          # Configurar sparse checkout para estrutura mínima
+          git config core.sparseCheckout true
+          echo "/*" > .git/info/sparse-checkout
+          echo "!/*/" >> .git/info/sparse-checkout
+          echo "/projetos/" >> .git/info/sparse-checkout
+          
+          # Fazer fetch e checkout
+          git pull origin main || echo "⚠️  Pull inicial falhou, continuando..."
+
+          # Criar estrutura de diretórios completa se não existir
+          echo "🔍 Verificando estrutura de diretórios..."
+          if [ ! -d "$PROJETO_PATH" ]; then
+            echo "📂 Criando estrutura: $PROJETO_PATH"
+            mkdir -p "$PROJETO_PATH"
+            
+            # Garantir que a pasta projetos está sendo rastreada
+            if [ ! -d "projetos" ]; then
+              mkdir -p "projetos"
+              touch "projetos/.gitkeep"
+            fi
+          fi
+
+          # Copiar arquivo
+          echo "📄 Copiando .deploy.env para $PROJETO_PATH/"
+          cp ../.deploy.env "$PROJETO_PATH/"        
+
+
+          # Commit e push
+          git add -A
+          if git diff --staged --quiet; then
+            echo "ℹ️  Nenhuma alteração para commitar"
+          else
+            git commit -m "feat: Adiciona .deploy.env em $PROJETO_PATH"
+            git push origin main
+            echo "✅ Arquivo enviado com sucesso!"
+          fi
+
+          # Limpeza
+          cd ..
+          rm -rf "$WORK_DIR"
+
+          # Criando Secret no Repo de Infra
+          gh secret set $NOVA_SECRET_NAME --body ${{ steps.arquivo-deploy-secrets.outputs.PWD_BD }} --repo $REPOSITORIO_INFRA
